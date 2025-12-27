@@ -27,3 +27,5 @@ apps/worker/.env.*.local
 apps/worker/.env
 apps/worker/.env.local
 apps/worker/.env.*.local
+# turbo cache/logs
+.turbo/
