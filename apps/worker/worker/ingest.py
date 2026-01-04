@@ -1,138 +1,246 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Optional, Tuple
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any, Optional
 
 import psycopg
+import psycopg.rows
+import requests
 
-from .daily_index import IndexRow
-from .form4_parser import parse_form4_xml
-from .sec_client import SecClient
+from .config import DATABASE_URL
+from .daily_index import fetch_form4_refs_for_date, iter_dates_back
+from .form4_parser import parse_form4_xml  # your form4_parser.py MUST expose parse_form4_xml(...)
+from .sec_client import fetch_form4_xml, make_session
 
-def accession_from_filename(filename: str) -> str:
-    base = filename.split("/")[-1]
-    return base.replace(".txt", "").replace(".hdr.sgml", "")
 
-def accession_nodash(accession: str) -> str:
-    return accession.replace("-", "")
+def _connect():
+    return psycopg.connect(DATABASE_URL, row_factory=psycopg.rows.dict_row)
 
-def filing_index_json_url(cik: str, accession: str) -> str:
-    cik_int = str(int(cik))
-    return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash(accession)}/index.json"
 
-def pick_xml_from_index(index_json: dict) -> Optional[str]:
+def _to_text(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _to_date(v: Any) -> Optional[date]:
+    if v is None:
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    s = str(v).strip()
+    if not s:
+        return None
+    # accept "YYYY-MM-DD" or full timestamp
+    s = s[:10]
     try:
-        items = index_json["directory"]["item"]
+        return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         return None
-    # Prefer files that look like the primary Form 4 XML
-    preferred = []
-    for it in items:
-        name = (it.get("name") or "").lower()
-        if name.endswith(".xml"):
-            preferred.append(it.get("name"))
-    if not preferred:
+
+
+def _to_decimal(v: Any) -> Optional[Decimal]:
+    if v is None:
         return None
-    # Heuristic: prefer something with "form4" or "primary" if present
-    for n in preferred:
-        nl = n.lower()
-        if "form4" in nl or "primary" in nl:
-            return n
-    return preferred[0]
+    if isinstance(v, Decimal):
+        return v
+    if isinstance(v, (int, float)):
+        return Decimal(str(v))
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace(",", "")
+    try:
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
 
-def primary_xml_url(cik: str, accession: str, xml_name: str) -> str:
-    cik_int = str(int(cik))
-    return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash(accession)}/{xml_name}"
 
-def upsert_company(conn, cik: str, name: str) -> None:
-    conn.execute(
+def _tx_get(tx: Any, key: str) -> Any:
+    """
+    Supports both dict-like tx and dataclass/object tx.
+    """
+    if tx is None:
+        return None
+    if isinstance(tx, dict):
+        return tx.get(key)
+    return getattr(tx, key, None)
+
+
+def upsert_company(cur, issuer_cik: str, name: str, ticker: Optional[str]) -> None:
+    """
+    Fixes the Postgres error:
+      "could not determine data type of parameter $2"
+    by avoiding `CASE WHEN %s IS NULL ...` (type-less param).
+    """
+    issuer_cik = str(issuer_cik).strip()
+    name = str(name).strip()
+    ticker = (ticker or "").strip() or None
+
+    # Update all existing rows for this CIK (your web query uses DISTINCT ON)
+    cur.execute(
         """
-        INSERT INTO companies (issuer_cik, name)
-        VALUES (%s, %s)
-        ON CONFLICT (issuer_cik) DO UPDATE SET name = EXCLUDED.name
+        update companies
+           set name   = %s::text,
+               ticker = coalesce(nullif(%s::text, ''), ticker)
+         where issuer_cik = %s::text
         """,
-        (cik, name),
+        (name, ticker or "", issuer_cik),
     )
 
-def upsert_insider(conn, owner_cik: Optional[str], name: str) -> None:
-    conn.execute(
+    # Insert a row if missing
+    cur.execute(
         """
-        INSERT INTO insiders (owner_cik, name)
-        VALUES (%s, %s)
-        ON CONFLICT (owner_cik, name) DO NOTHING
+        insert into companies (issuer_cik, name, ticker)
+        select %s::text, %s::text, nullif(%s::text,'')
+        where not exists (select 1 from companies where issuer_cik = %s::text)
         """,
-        (owner_cik, name),
+        (issuer_cik, name, ticker or "", issuer_cik),
     )
 
-def upsert_filing(conn, row: IndexRow, accession: str, sec_url: str, primary_doc: Optional[str]) -> None:
-    filed_at = datetime(row.date_filed.year, row.date_filed.month, row.date_filed.day)
-    conn.execute(
-        """
-        INSERT INTO form4_filings (accession_number, issuer_cik, filed_at, primary_doc, sec_url)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (accession_number) DO UPDATE
-        SET issuer_cik = EXCLUDED.issuer_cik,
-            filed_at = COALESCE(form4_filings.filed_at, EXCLUDED.filed_at),
-            primary_doc = COALESCE(EXCLUDED.primary_doc, form4_filings.primary_doc),
-            sec_url = COALESCE(EXCLUDED.sec_url, form4_filings.sec_url)
-        """,
-        (accession, row.cik, filed_at, primary_doc, sec_url),
-    )
 
-def insert_transaction(conn, accession: str, issuer_cik: str, owner_name: str, tx: dict) -> None:
-    tx_date = tx.get("transaction_date") or ""
-    conn.execute(
+def insert_transaction(cur, issuer_cik: str, accession: str, owner_name: Optional[str], tx: Any) -> bool:
+    """
+    Idempotent insert using your existing UNIQUE constraint:
+    (accession_number, transaction_date, transaction_code, shares, price, security_title)
+
+    Returns True if inserted, False if skipped.
+    """
+    issuer_cik = str(issuer_cik).strip()
+    accession = str(accession).strip()
+
+    owner_name = (owner_name or "").strip() or "UNKNOWN"
+
+    transaction_date = _to_date(_tx_get(tx, "transaction_date"))
+    transaction_code = _to_text(_tx_get(tx, "transaction_code"))
+    shares = _to_decimal(_tx_get(tx, "shares"))
+    price = _to_decimal(_tx_get(tx, "price"))
+    total_value = _to_decimal(_tx_get(tx, "total_value"))
+    security_title = _to_text(_tx_get(tx, "security_title"))
+    is_direct = _tx_get(tx, "is_direct")
+
+    # Normalize is_direct to bool/None
+    if isinstance(is_direct, str):
+        is_direct = is_direct.strip().lower()
+        if is_direct in ("1", "true", "t", "yes", "y"):
+            is_direct = True
+        elif is_direct in ("0", "false", "f", "no", "n"):
+            is_direct = False
+        else:
+            is_direct = None
+
+    # If total_value missing but shares & price exist, compute it
+    if total_value is None and shares is not None and price is not None:
+        total_value = shares * price
+
+    # Required fields for uniqueness + sanity
+    if transaction_date is None or not transaction_code or security_title is None:
+        return False
+
+    cur.execute(
         """
-        INSERT INTO transactions (
-          accession_number, issuer_cik, owner_name,
-          transaction_date, transaction_code,
-          shares, price, total_value,
-          is_direct, security_title
+        insert into transactions (
+          issuer_cik,
+          accession_number,
+          owner_name,
+          transaction_date,
+          transaction_code,
+          shares,
+          price,
+          total_value,
+          is_direct,
+          security_title
         )
-        VALUES (
-          %s, %s, %s,
-          NULLIF(%s,'')::date, %s,
-          %s, %s, %s,
-          %s, %s
-        )
-        ON CONFLICT DO NOTHING
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict (accession_number, transaction_date, transaction_code, shares, price, security_title)
+        do nothing
         """,
         (
-            accession, issuer_cik, owner_name,
-            tx_date,
-            tx.get("transaction_code"),
-            tx.get("shares"),
-            tx.get("price"),
-            tx.get("total_value"),
-            tx.get("is_direct"),
-            tx.get("security_title"),
+            issuer_cik,
+            accession,
+            owner_name,
+            transaction_date,
+            transaction_code,
+            shares,
+            price,
+            total_value,
+            is_direct,
+            security_title,
         ),
     )
+    return cur.rowcount == 1
 
-def ingest_index_row(conn, client: SecClient, row: IndexRow) -> Tuple[str, int]:
-    accession = accession_from_filename(row.filename)
-    filing_txt_url = f"https://www.sec.gov/Archives/{row.filename}"
 
-    idx_url = filing_index_json_url(row.cik, accession)
-    idx_json = client.get_json(idx_url)
-    xml_name = pick_xml_from_index(idx_json)
+def ingest_day(d: date, max_filings: int = 200) -> dict:
+    """
+    Ingest all Form 4 filings for one day from the SEC daily index.
+    """
+    session = make_session()
 
-    # Always upsert base company + filing row
-    upsert_company(conn, row.cik, row.company_name)
-    upsert_filing(conn, row, accession, filing_txt_url, xml_name)
+    try:
+        refs = fetch_form4_refs_for_date(session, user_agent=session.headers["User-Agent"], d=d)
+    except requests.HTTPError as e:
+        # You already handle the 403 in daily_index, but keep this as a safety net.
+        print(f"[daily-index] {e}")
+        refs = []
 
-    if not xml_name:
-        return accession, 0
+    refs = refs[:max_filings]
 
-    xml_url = primary_xml_url(row.cik, accession, xml_name)
-    xml_text = client.get_text(xml_url)
-    parsed = parse_form4_xml(xml_text)
+    stats = {
+        "date": str(d),
+        "refs_found": len(refs),
+        "filings_ok": 0,
+        "filings_failed": 0,
+        "transactions_inserted": 0,
+        "transactions_skipped": 0,
+    }
 
-    upsert_insider(conn, parsed.owner_cik, parsed.owner_name)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for ref in refs:
+                try:
+                    # robust XML extraction; pass cik+accession for index.json fallback
+                    xml = fetch_form4_xml(session, ref.url, cik=ref.cik, accession=ref.accession_number)
+                    parsed = parse_form4_xml(xml)
 
-    n = 0
-    for tx in parsed.transactions:
-        insert_transaction(conn, accession, row.cik, parsed.owner_name, tx)
-        n += 1
+                    issuer_cik = getattr(parsed, "issuer_cik", None) or ref.cik
+                    issuer_name = getattr(parsed, "issuer_name", None) or ref.company_name
+                    ticker = getattr(parsed, "ticker", None)
+                    owner_name = getattr(parsed, "owner_name", None)
 
-    return accession, n
+                    upsert_company(cur, issuer_cik, issuer_name, ticker)
+
+                    inserted = 0
+                    skipped = 0
+
+                    txs = getattr(parsed, "transactions", None) or []
+                    for tx in txs:
+                        did = insert_transaction(cur, issuer_cik, ref.accession_number, owner_name, tx)
+                        if did:
+                            inserted += 1
+                        else:
+                            skipped += 1
+
+                    conn.commit()
+
+                    stats["filings_ok"] += 1
+                    stats["transactions_inserted"] += inserted
+                    stats["transactions_skipped"] += skipped
+
+                except Exception as e:
+                    conn.rollback()
+                    stats["filings_failed"] += 1
+                    print(f"[WARN] {ref.accession_number} failed: {e}")
+
+    return stats
+
+
+def backfill(days: int = 10, max_filings_per_day: int = 200) -> None:
+    dates = iter_dates_back(days)
+    for d in dates:
+        s = ingest_day(d, max_filings=max_filings_per_day)
+        print("[OK]", s)

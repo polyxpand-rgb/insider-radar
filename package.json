@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
-    "lint": "turbo lint"
+    "lint": "turbo lint",
+    "db:migrate": "pnpm -C packages/db migrate"
   },
   "devDependencies": {
     "turbo": "^2.0.0"

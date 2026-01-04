@@ -1,91 +1,106 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from typing import List, Optional
+from datetime import date, timedelta
+from typing import List
 
-from .sec_client import SecClient
+import requests
+
 
 @dataclass(frozen=True)
-class IndexRow:
+class FilingRef:
     cik: str
     company_name: str
     form_type: str
-    date_filed: date
-    filename: str
+    date_filed: str
+    file_name: str  # "edgar/data/.../0001234567-25-000001.txt"
+    accession_number: str  # "0001234567-25-000001"
+    url: str  # full URL to the .txt in Archives
 
-def _quarter(d: date) -> int:
+
+def _quarter_for(d: date) -> int:
     return (d.month - 1) // 3 + 1
 
-def daily_master_index_url(d: date) -> str:
-    y = d.year
-    q = _quarter(d)
-    ymd = d.strftime("%Y%m%d")
-    return f"https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{q}/master.{ymd}.idx"
 
-def _parse_date(s: str) -> Optional[date]:
-    s = (s or "").strip()
-    # YYYY-MM-DD
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        try:
-            y, m, d = s.split("-")
-            return date(int(y), int(m), int(d))
-        except Exception:
-            return None
-    # YYYYMMDD
-    if len(s) == 8 and s.isdigit():
-        try:
-            return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
-        except Exception:
-            return None
-    return None
+def _master_idx_url(d: date) -> str:
+    q = _quarter_for(d)
+    return f"https://www.sec.gov/Archives/edgar/daily-index/{d.year}/QTR{q}/master.{d:%Y%m%d}.idx"
 
-def parse_master_idx(text: str) -> List[IndexRow]:
-    out: List[IndexRow] = []
 
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
+def iter_dates_back(days: int, end: date | None = None) -> List[date]:
+    end = end or date.today()
+    return [end - timedelta(days=i) for i in range(days)]
+
+
+def fetch_form4_refs_for_date(
+    session: requests.Session,
+    user_agent: str,
+    d: date,
+) -> List[FilingRef]:
+    url = _master_idx_url(d)
+
+    # Use session headers; but keep UA override explicit
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/plain,*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+    }
+
+    r = session.get(url, headers=headers, timeout=30)
+
+    # The file may not exist yet for "today" — SEC sometimes returns 403 instead of 404
+    if r.status_code == 404:
+        return []
+    if r.status_code == 403:
+        print(f"[daily-index] 403 for {url} (skipping)")
+        return []
+
+    r.raise_for_status()
+    text = r.text
+    lines = text.splitlines()
+
+    # Find header line then parse after it
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("CIK|Company Name|Form Type|Date Filed|File Name"):
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    out: List[FilingRef] = []
+    for line in lines[start:]:
+        if not line.strip():
             continue
-
-        # skip non-data lines
-        if line.startswith("Description:") or line.startswith("Last Data Received:"):
-            continue
-        if line.startswith("CIK|") or set(line) == {"-"}:
-            continue
-        if "|" not in line:
-            continue
-
         parts = line.split("|")
-
-        # remove trailing empty parts (if line ends with |)
-        while parts and parts[-1].strip() == "":
-            parts.pop()
-
-        if len(parts) < 5:
+        if len(parts) != 5:
             continue
 
-        # robust parse from right
-        filename = parts[-1].strip()
-        filed_str = parts[-2].strip()
-        form_type = parts[-3].strip()
-        cik = parts[0].strip()
-        company = "|".join(parts[1:-3]).strip()
+        cik, cname, form, date_filed, file_name = [p.strip() for p in parts]
+        form_u = form.upper()
 
-        if form_type not in ("4", "4/A"):
-            continue
-        if not cik.isdigit():
+        # include 4 and 4/A
+        if not (form_u == "4" or form_u == "4/A" or form_u.startswith("4 ")):
             continue
 
-        filed_date = _parse_date(filed_str)
-        if not filed_date:
-            continue
+        # file_name example: edgar/data/1162870/0001193125-25-310142.txt
+        accession = file_name.split("/")[-1].replace(".txt", "")
+        full_url = "https://www.sec.gov/Archives/" + file_name
 
-        out.append(IndexRow(cik=cik, company_name=company, form_type=form_type, date_filed=filed_date, filename=filename))
+        out.append(
+            FilingRef(
+                cik=cik,
+                company_name=cname,
+                form_type=form,
+                date_filed=date_filed,
+                file_name=file_name,
+                accession_number=accession,
+                url=full_url,
+            )
+        )
 
     return out
-
-def fetch_form4_rows(client: SecClient, d: date) -> List[IndexRow]:
-    url = daily_master_index_url(d)
-    text = client.get_text(url)
-    return parse_master_idx(text)
