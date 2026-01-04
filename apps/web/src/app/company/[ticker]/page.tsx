@@ -40,12 +40,19 @@ function fmtDate(value: string | null) {
   return d.toLocaleDateString();
 }
 
-export default async function CompanyPage({
-  params,
-}: {
-  params: { ticker: string };
-}) {
-  const ticker = (params.ticker || "").trim().toUpperCase();
+type PageProps = {
+  // Next.js can provide params as a Promise in some setups; handle both.
+  params: { ticker: string } | Promise<{ ticker: string }>;
+};
+
+export default async function CompanyPage({ params }: PageProps) {
+  // ✅ Critical fix: ensure params is resolved (prevents blank ticker on page)
+  const resolvedParams = await Promise.resolve(params);
+
+  const ticker = decodeURIComponent(String(resolvedParams.ticker ?? ""))
+    .trim()
+    .toUpperCase();
+
   const rows = await getCompanyTransactions(ticker, 200);
   const companyName = rows[0]?.company_name ?? "—";
 
@@ -62,9 +69,7 @@ export default async function CompanyPage({
               {ticker} <span className="text-zinc-500">— {companyName}</span>
             </h1>
 
-            <p className="mt-1 text-sm text-zinc-600">
-              Latest transactions (max 200)
-            </p>
+            <p className="mt-1 text-sm text-zinc-600">Latest transactions (max 200)</p>
           </div>
         </div>
 
