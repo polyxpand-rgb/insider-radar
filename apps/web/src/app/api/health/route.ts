@@ -1,37 +1,31 @@
-import { Pool } from "pg";
+// apps/web/src/app/api/health/route.ts
+import { pool } from "@/lib/db";
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __pgPool: Pool | undefined;
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return "Unknown error";
+  }
 }
-
-const pool =
-  global.__pgPool ??
-  new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 5,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000,
-  });
-
-global.__pgPool = pool;
 
 export async function GET() {
   try {
-    const r = await pool.query("SELECT now() as now, 1 as ok");
+    const r = await pool.query<{ now: string; ok: number }>(
+      "SELECT now() as now, 1 as ok",
+    );
+
     return Response.json({
       ok: true,
       web_db_ok: r.rows[0]?.ok === 1,
       now: r.rows[0]?.now ?? null,
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     return Response.json(
-      {
-        ok: false,
-        web_db_ok: false,
-        error: err?.message ?? String(err),
-      },
-      { status: 500 }
+      { ok: false, web_db_ok: false, error: errorMessage(err) },
+      { status: 500 },
     );
   }
 }
