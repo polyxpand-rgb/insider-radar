@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
-    "lint": "turbo lint",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "check": "pnpm -w lint && pnpm -w typecheck && pnpm -w test",
     "db:migrate": "pnpm -C packages/db migrate"
   },
   "devDependencies": {
