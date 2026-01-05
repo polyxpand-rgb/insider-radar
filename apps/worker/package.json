@@ -1,0 +1,10 @@
+{
+  "name": "worker",
+  "private": true,
+  "scripts": {
+    "dev": "cmd /c \"..\\..\\.venv\\Scripts\\python.exe -m worker.cli backfill --days 1 --max-filings-per-day 5\"",
+    "lint": "echo worker:lint (skip)",
+    "typecheck": "echo worker:typecheck (skip)",
+    "test": "echo worker:test (skip)"
+  }
+}
