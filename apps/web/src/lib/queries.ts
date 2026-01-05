@@ -56,7 +56,7 @@ export async function getTopMoves(
 
   // Build WHERE conditions safely (no "param type unknown" issues)
   const where: string[] = [];
-  const params: any[] = [safeLimit];
+const params: Array<number | string> = [safeLimit];
   let p = 2;
 
   // Only show rows that actually have a ticker (clean dashboard)
